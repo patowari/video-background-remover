@@ -1,4 +1,6 @@
 # Video Background Removal Application Setup Guide
+<img width="1018" height="921" alt="image" src="https://github.com/user-attachments/assets/56bebd7a-8931-4e00-a2e0-06c66aba209d" />
+
 
 ## Project Structure
 ```
