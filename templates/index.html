@@ -275,13 +275,14 @@
             font-weight: bold;
         }
 
+        .loading {
+            opacity: 0.7;
+            pointer-events: none;
+        }
+
         @media (max-width: 600px) {
             .method-options {
-                flex-direction: column;
-            }
-            
-            .method-option {
-                min-width: auto;
+                grid-template-columns: 1fr;
             }
             
             .header h1 {
@@ -313,43 +314,46 @@
 
             <div class="method-selection">
                 <h3>Choose Background Removal Method:</h3>
-                <div class="method-options">
+                <div class="method-options" id="method-options">
                     <div class="method-option">
-                        <input type="radio" id="ai_normal" name="method" value="ai_normal" checked>
-                        <label for="ai_normal">
-                            <strong>AI Normal</strong><br>
-                            <small>High accuracy AI removal</small>
-                        </label>
-                    </div>
-                    <div class="method-option">
-                        <input type="radio" id="ai_fast" name="method" value="ai_fast">
-                        <label for="ai_fast">
-                            <strong>AI Fast</strong><br>
-                            <small>Fast AI processing</small>
-                        </label>
-                    </div>
-                    <div class="method-option">
-                        <input type="radio" id="mog2" name="method" value="mog2">
-                        <label for="mog2">
-                            <strong>MOG2</strong><br>
-                            <small>Classic method</small>
-                        </label>
+                        <input type="radio" id="mog2" name="method" value="mog2" checked>
+                        <label for="mog2">MOG2 (Fast)</label>
                     </div>
                     <div class="method-option">
                         <input type="radio" id="grabcut" name="method" value="grabcut">
-                        <label for="grabcut">
-                            <strong>GrabCut</strong><br>
-                            <small>Static scenes</small>
-                        </label>
+                        <label for="grabcut">GrabCut</label>
                     </div>
                     <div class="method-option">
                         <input type="radio" id="contours" name="method" value="contours">
-                        <label for="contours">
-                            <strong>Contours</strong><br>
-                            <small>Fast edge detection</small>
-                        </label>
+                        <label for="contours">Contours</label>
                     </div>
                 </div>
+            </div>
+
+            <div class="performance-settings" style="margin: 20px 0; padding: 20px; background: linear-gradient(135deg, #e8f4f8, #f8f9ff); border-radius: 10px;">
+                <h4 style="margin-bottom: 15px; color: #333;">⚡ Performance Settings</h4>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                    <div>
+                        <label style="display: block; margin-bottom: 5px; font-weight: bold;">Quality:</label>
+                        <select id="quality-setting" style="width: 100%; padding: 8px; border-radius: 5px; border: 1px solid #ddd;">
+                            <option value="fast">Fast (640p, skip frames)</option>
+                            <option value="balanced" selected>Balanced (720p)</option>
+                            <option value="high">High Quality (original size)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="display: block; margin-bottom: 5px; font-weight: bold;">Max Duration:</label>
+                        <select id="duration-limit" style="width: 100%; padding: 8px; border-radius: 5px; border: 1px solid #ddd;">
+                            <option value="30">30 seconds</option>
+                            <option value="60" selected>1 minute</option>
+                            <option value="120">2 minutes</option>
+                            <option value="300">5 minutes</option>
+                        </select>
+                    </div>
+                </div>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    💡 <strong>Tip:</strong> Use "Fast" setting for quick previews, "Balanced" for good results, "High Quality" for final videos.
+                </p>
             </div>
 
             <button class="process-btn" id="process-btn" disabled>
@@ -392,6 +396,7 @@
         let selectedFile = null;
         let currentTaskId = null;
         let pollInterval = null;
+        let availableMethods = [];
 
         const uploadArea = document.getElementById('upload-area');
         const fileInput = document.getElementById('file-input');
@@ -404,6 +409,63 @@
         const resultVideo = document.getElementById('result-video');
         const downloadBtn = document.getElementById('download-btn');
         const newVideoBtn = document.getElementById('new-video-btn');
+        const methodOptions = document.getElementById('method-options');
+
+        // Load available methods on page load
+        window.addEventListener('load', loadAvailableMethods);
+
+        async function loadAvailableMethods() {
+            try {
+                const response = await fetch('/methods');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    availableMethods = data.methods;
+                    updateMethodOptions(data.methods, data.ai_available);
+                } else {
+                    console.error('Failed to load methods:', data);
+                    // Use default methods if API call fails
+                    updateMethodOptions(['mog2', 'grabcut', 'contours'], false);
+                }
+            } catch (error) {
+                console.error('Error loading methods:', error);
+                // Use default methods if API call fails
+                updateMethodOptions(['mog2', 'grabcut', 'contours'], false);
+            }
+        }
+
+        function updateMethodOptions(methods, aiAvailable) {
+            const methodLabels = {
+                'ai_normal': 'AI Normal (Best Quality)',
+                'ai_fast': 'AI Fast (Quick)',
+                'mog2': 'MOG2 (Fast)',
+                'grabcut': 'GrabCut',
+                'contours': 'Contours (Fastest)'
+            };
+
+            let html = '';
+            methods.forEach((method, index) => {
+                const label = methodLabels[method] || method.toUpperCase();
+                const checked = index === 0 ? 'checked' : '';
+                html += `
+                    <div class="method-option">
+                        <input type="radio" id="${method}" name="method" value="${method}" ${checked}>
+                        <label for="${method}">${label}</label>
+                    </div>
+                `;
+            });
+
+            methodOptions.innerHTML = html;
+
+            // Update info section if AI is not available
+            if (!aiAvailable) {
+                const infoSection = document.querySelector('.info-section');
+                const aiWarning = document.createElement('p');
+                aiWarning.style.cssText = 'margin-top: 15px; padding: 10px; background: rgba(255,255,255,0.2); border-radius: 8px; font-size: 0.9em;';
+                aiWarning.innerHTML = '<strong>⚠️ Note:</strong> AI methods are not available. Install PyTorch and transparent-background for AI-powered removal.';
+                infoSection.appendChild(aiWarning);
+            }
+        }
 
         // File upload handling
         uploadArea.addEventListener('click', () => fileInput.click());
@@ -483,10 +545,21 @@
         async function processVideo() {
             if (!selectedFile) return;
 
-            const method = document.querySelector('input[name="method"]:checked').value;
+            const methodInput = document.querySelector('input[name="method"]:checked');
+            if (!methodInput) {
+                showError('Please select a background removal method');
+                return;
+            }
+
+            const method = methodInput.value;
+            const quality = document.getElementById('quality-setting').value;
+            const duration = document.getElementById('duration-limit').value;
+            
             const formData = new FormData();
             formData.append('video', selectedFile);
             formData.append('method', method);
+            formData.append('quality', quality);
+            formData.append('duration_limit', duration);
 
             processBtn.disabled = true;
             processBtn.textContent = 'Uploading...';
@@ -516,6 +589,7 @@
         }
 
         function startPolling() {
+            processBtn.textContent = 'Processing...';
             progressText.textContent = 'Processing video...';
             
             pollInterval = setInterval(async () => {
@@ -554,6 +628,8 @@
         function showResult(outputFile) {
             progressSection.style.display = 'none';
             resultSection.style.display = 'block';
+            processBtn.textContent = 'Process Video';
+            processBtn.disabled = false;
             
             resultVideo.src = `/download/${outputFile}`;
             
@@ -578,6 +654,9 @@
                 <div class="upload-text">Click to upload your video or drag and drop</div>
                 <div class="upload-hint">Supports MP4, AVI, MOV, MKV, WEBM (Max: 100MB)</div>
             `;
+            
+            // Reset file input
+            fileInput.value = '';
         }
 
         // New video button
