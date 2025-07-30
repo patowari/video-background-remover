@@ -7,22 +7,33 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from PIL import Image
-import torch
 import random
 
-# Disable torch jit for compatibility
-torch.jit.script = lambda f: f
+# Try to import AI dependencies
+TRANSPARENT_BG_AVAILABLE = False
+AI_DEPENDENCIES_AVAILABLE = False
 
 try:
-    from transparent_background import Remover
-    TRANSPARENT_BG_AVAILABLE = True
+    import torch
+    from PIL import Image
+    # Disable torch jit for compatibility
+    torch.jit.script = lambda f: f
+    AI_DEPENDENCIES_AVAILABLE = True
+    print("PyTorch available - AI methods can be used")
+    
+    try:
+        from transparent_background import Remover
+        TRANSPARENT_BG_AVAILABLE = True
+        print("transparent_background available - AI background removal enabled")
+    except ImportError:
+        print("Warning: transparent_background not installed. AI methods will be disabled.")
+        
 except ImportError:
-    print("Warning: transparent_background not installed. Only basic methods will be available.")
-    TRANSPARENT_BG_AVAILABLE = False
+    print("PyTorch not installed. Only traditional CV methods will be available.")
+    print("To install PyTorch (CPU-only): pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu")
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024   # 100MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 
 # Create necessary directories
 UPLOAD_FOLDER = 'uploads'
@@ -40,26 +51,34 @@ def allowed_file(filename):
 
 class BackgroundRemover:
     def __init__(self):
-        global TRANSPARENT_BG_AVAILABLE  # Add this line
+        global TRANSPARENT_BG_AVAILABLE  # Move global declaration to the top
+        
         self.background_subtractor = cv2.createBackgroundSubtractorMOG2(
             detectShadows=True, varThreshold=50, history=500
         )
+        # Initialize transparent background removers only if available
         self.ai_remover_normal = None
         self.ai_remover_fast = None
-
-        if TRANSPARENT_BG_AVAILABLE:
+        
+        if TRANSPARENT_BG_AVAILABLE and AI_DEPENDENCIES_AVAILABLE:
             try:
                 print("Initializing AI background removers...")
                 self.ai_remover_fast = Remover(mode='fast')
-                self.ai_remover_normal = Remover()
+                self.ai_remover_normal = Remover()  # Normal mode
                 print("AI background removers initialized successfully")
             except Exception as e:
                 print(f"Error initializing AI removers: {e}")
-                TRANSPARENT_BG_AVAILABLE = False  # Modifying global var
-
+                TRANSPARENT_BG_AVAILABLE = False
     
-    def remove_background(self, input_path, output_path, method='mog2', progress_callback=None):
-        """Remove background from video using specified method"""
+    def get_available_methods(self):
+        """Return list of available methods based on dependencies"""
+        methods = ['mog2', 'grabcut', 'contours']
+        if TRANSPARENT_BG_AVAILABLE and AI_DEPENDENCIES_AVAILABLE:
+            methods = ['ai_normal', 'ai_fast'] + methods
+        return methods
+    
+    def remove_background(self, input_path, output_path, method='mog2', progress_callback=None, quality='balanced', duration_limit=60):
+        """Remove background from video using specified method with performance settings"""
         cap = cv2.VideoCapture(input_path)
         
         if not cap.isOpened():
@@ -71,64 +90,108 @@ class BackgroundRemover:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
+        # Performance optimizations based on quality setting
+        if quality == 'fast':
+            # Fast: 640p max, skip every other frame
+            process_width = min(640, width)
+            process_height = int(height * (process_width / width))
+            frame_skip = 2
+            max_frames = min(total_frames, fps * duration_limit)  # Limit by duration
+        elif quality == 'balanced':
+            # Balanced: 720p max, process every frame
+            process_width = min(1280, width)
+            process_height = int(height * (process_width / width))
+            frame_skip = 1
+            max_frames = min(total_frames, fps * duration_limit)
+        else:  # high quality
+            # High: original size, process every frame
+            process_width = width
+            process_height = height
+            frame_skip = 1
+            max_frames = min(total_frames, fps * duration_limit)
+        
+        effective_fps = fps // frame_skip if frame_skip > 1 else fps
+        
         frame_count = 0
+        processed_count = 0
         writer = None
         start_time = time.time()
         
+        print(f"Quality: {quality}")
+        print(f"Processing up to {max_frames//frame_skip} frames (skipping every {frame_skip} frames)")
+        print(f"Resolution: {width}x{height} -> {process_width}x{process_height}")
+        print(f"Duration limit: {duration_limit}s")
+        
         try:
-            while True:
+            while processed_count < max_frames//frame_skip:
                 ret, frame = cap.read()
                 if not ret:
                     break
-
-                # Resize frame for faster processing (e.g., half size)
-                frame = cv2.resize(frame, (width // 2, height // 2))
                 
-                # Check for timeout (19 minutes for safety)
-                if time.time() - start_time >= 19 * 60:
+                frame_count += 1
+                
+                # Skip frames for faster processing
+                if frame_count % frame_skip != 0:
+                    continue
+                
+                # Check for timeout (reduced to 3 minutes)
+                if time.time() - start_time >= 3 * 60:
                     print("Processing timeout reached")
                     break
                 
-                if method in ['ai_normal', 'ai_fast']:
-                    processed_frame = self._process_with_ai(frame, method)
-                    
-                    # Initialize writer with PIL image dimensions
-                    if writer is None:
-                        pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                        writer = cv2.VideoWriter(output_path, fourcc, fps, pil_img.size)
+                # Resize frame for processing
+                if process_width != width or process_height != height:
+                    frame_resized = cv2.resize(frame, (process_width, process_height))
                 else:
-                    # Traditional methods
-                    if writer is None:
-                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-                    
+                    frame_resized = frame
+                
+                # Initialize writer
+                if writer is None:
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    writer = cv2.VideoWriter(output_path, fourcc, effective_fps, (process_width, process_height))
+                
+                # Process frame based on method
+                if method in ['ai_normal', 'ai_fast'] and TRANSPARENT_BG_AVAILABLE and AI_DEPENDENCIES_AVAILABLE:
+                    processed_frame = self._process_with_ai(frame_resized, method)
+                else:
+                    # Use fast traditional methods
                     if method == 'mog2':
-                        processed_frame = self._process_with_mog2(frame)
+                        processed_frame = self._process_with_mog2_fast(frame_resized)
                     elif method == 'grabcut':
-                        processed_frame = self._process_with_grabcut(frame)
+                        processed_frame = self._process_with_grabcut_fast(frame_resized)
                     else:
-                        processed_frame = self._process_with_contours(frame)
+                        processed_frame = self._process_with_contours_fast(frame_resized)
                 
                 writer.write(processed_frame)
-                frame_count += 1
+                processed_count += 1
                 
                 # Update progress
-                if progress_callback and total_frames > 0:
-                    progress = (frame_count / total_frames) * 100
-                    progress_callback(progress)
-                    
-                print(f"Processing frame {frame_count}/{total_frames}")
+                if progress_callback:
+                    progress = (processed_count / (max_frames//frame_skip)) * 100
+                    progress_callback(min(progress, 100))
+                
+                # Print progress every 20 frames
+                if processed_count % 20 == 0:
+                    elapsed = time.time() - start_time
+                    fps_rate = processed_count / elapsed if elapsed > 0 else 0
+                    eta = (max_frames//frame_skip - processed_count) / fps_rate if fps_rate > 0 else 0
+                    print(f"Processed {processed_count}/{max_frames//frame_skip} frames ({fps_rate:.1f} fps, ETA: {eta:.1f}s)")
         
         finally:
             cap.release()
             if writer:
                 writer.release()
+            
+        processing_time = time.time() - start_time
+        print(f"Processing completed in {processing_time:.1f} seconds")
+        print(f"Average processing speed: {processed_count/processing_time:.1f} fps")
     
     def _process_with_ai(self, frame, method):
         """Process frame using AI-based transparent background removal"""
-        if not TRANSPARENT_BG_AVAILABLE:
-            raise ValueError("Transparent background library not available")
+        if not TRANSPARENT_BG_AVAILABLE or not AI_DEPENDENCIES_AVAILABLE:
+            raise ValueError("AI background removal not available")
+        
+        from PIL import Image
         
         # Convert BGR to RGB for PIL
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -151,6 +214,8 @@ class BackgroundRemover:
         processed_frame = cv2.cvtColor(processed_array, cv2.COLOR_RGB2BGR)
         
         return processed_frame
+    
+    def _process_with_mog2_fast(self, frame):
         """Process frame using MOG2 background subtraction"""
         # Apply background subtraction
         fg_mask = self.background_subtractor.apply(frame)
@@ -171,7 +236,7 @@ class BackgroundRemover:
         
         return result.astype(np.uint8)
     
-    def _process_with_grabcut(self, frame):
+    def _process_with_grabcut_fast(self, frame):
         """Process frame using GrabCut algorithm"""
         height, width = frame.shape[:2]
         
@@ -199,7 +264,7 @@ class BackgroundRemover:
         
         return result
     
-    def _process_with_contours(self, frame):
+    def _process_with_contours_fast(self, frame):
         """Process frame using contour detection"""
         # Convert to grayscale and apply threshold
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -231,6 +296,12 @@ class BackgroundRemover:
 
 bg_remover = BackgroundRemover()
 
+@app.route('/methods')
+def get_methods():
+    """Get available methods based on installed dependencies"""
+    methods = bg_remover.get_available_methods()
+    return jsonify({'methods': methods, 'ai_available': TRANSPARENT_BG_AVAILABLE and AI_DEPENDENCIES_AVAILABLE})
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -242,6 +313,8 @@ def upload_video():
     
     file = request.files['video']
     method = request.form.get('method', 'mog2')
+    quality = request.form.get('quality', 'balanced')
+    duration_limit = int(request.form.get('duration_limit', 60))
     
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
@@ -262,7 +335,12 @@ def upload_video():
     
     # Initialize processing status
     task_id = timestamp
-    processing_status[task_id] = {'progress': 0, 'status': 'processing', 'output_file': output_filename}
+    processing_status[task_id] = {
+        'progress': 0, 
+        'status': 'processing', 
+        'output_file': output_filename,
+        'settings': {'method': method, 'quality': quality, 'duration_limit': duration_limit}
+    }
     
     # Start processing in background
     def process_video():
@@ -270,7 +348,9 @@ def upload_video():
             def progress_callback(progress):
                 processing_status[task_id]['progress'] = progress
             
-            bg_remover.remove_background(input_path, output_path, method, progress_callback)
+            bg_remover.remove_background(
+                input_path, output_path, method, progress_callback, quality, duration_limit
+            )
             processing_status[task_id]['status'] = 'completed'
             processing_status[task_id]['progress'] = 100
             
@@ -280,6 +360,7 @@ def upload_video():
         except Exception as e:
             processing_status[task_id]['status'] = 'error'
             processing_status[task_id]['error'] = str(e)
+            print(f"Processing error: {e}")
     
     thread = threading.Thread(target=process_video)
     thread.start()
